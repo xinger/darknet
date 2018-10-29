@@ -318,21 +318,28 @@ void draw_detections_v3(image im, detection *dets, int num, float thresh, char *
 
     // text output
     qsort(selected_detections, selected_detections_num, sizeof(*selected_detections), compare_by_lefts);
+    
     int i;
     for (i = 0; i < selected_detections_num; ++i) {
+
         const int best_class = selected_detections[i].best_class;
-        printf("%s: %.0f%%", names[best_class],    selected_detections[i].det.prob[best_class] * 100);
-        if (ext_output)
-            printf("\t(left_x: %4.0f   top_y: %4.0f   width: %4.0f   height: %4.0f)\n",
+        printf("        {\n            \"class\": \"%s\",\n            \"p\": %f,\n            \"class_id\": %i,\n", names[best_class], selected_detections[i].det.prob[best_class], best_class);
+        if (ext_output) {
+            printf("            \"x\": %0.0f,\n            \"y\": %0.0f,\n            \"w\": %0.0f,\n            \"h\": %0.0f,\n",
                 (selected_detections[i].det.bbox.x - selected_detections[i].det.bbox.w / 2)*im.w,
                 (selected_detections[i].det.bbox.y - selected_detections[i].det.bbox.h / 2)*im.h,
                 selected_detections[i].det.bbox.w*im.w, selected_detections[i].det.bbox.h*im.h);
-        else
+        
+            printf("            \"rx\": %f,\n            \"ry\": %f,\n            \"rw\": %f,\n            \"rh\": %f\n        },\n",
+                   selected_detections[i].det.bbox.x, selected_detections[i].det.bbox.y, selected_detections[i].det.bbox.w, selected_detections[i].det.bbox.h);
+        } else {
             printf("\n");
+        }
+        
         int j;
         for (j = 0; j < classes; ++j) {
             if (selected_detections[i].det.prob[j] > thresh && j != best_class) {
-                printf("%s: %.0f%%\n", names[j], selected_detections[i].det.prob[j] * 100);
+//                printf("######%s: %.0f%%\n", names[j], selected_detections[i].det.prob[j] * 100);
             }
         }
     }

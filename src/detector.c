@@ -6,6 +6,8 @@
 #include "box.h"
 #include "demo.h"
 #include "option_list.h"
+#include <libgen.h>
+#include <string.h>
 
 #ifdef OPENCV
 #include "opencv2/highgui/highgui_c.h"
@@ -1133,7 +1135,7 @@ void test_detector(char *datacfg, char *cfgfile, char *weightfile, char *filenam
             if(strlen(input) > 0)
                 if (input[strlen(input) - 1] == 0x0d) input[strlen(input) - 1] = 0;
         } else {
-            printf("Enter Image Path: ");
+            //printf("Enter Image Path: ");
             fflush(stdout);
             input = fgets(input, 256, stdin);
             if(!input) return;
@@ -1155,14 +1157,40 @@ void test_detector(char *datacfg, char *cfgfile, char *weightfile, char *filenam
         double time = get_time_point();
         network_predict(net, X);
         //network_predict_image(&net, im); letterbox = 1;
-        printf("%s: Predicted in %lf milli-seconds.\n", input, ((double)get_time_point() - time) / 1000);
-        //printf("%s: Predicted in %f seconds.\n", input, (what_time_is_it_now()-time));
-
+        
+        char *my_filename = basename(input);
+        
+        printf("{\n    \"filename\": \"%s\",\n", my_filename);
+        printf("    \"detections\": [\n");
+        //get_region_boxes(l, 1, 1, thresh, probs, boxes, 0, 0);
+        // if (nms) do_nms_sort_v2(boxes, probs, l.w*l.h*l.n, l.classes, nms);
+        //draw_detections(im, l.w*l.h*l.n, thresh, boxes, probs, names, alphabet, l.classes);
         int nboxes = 0;
         detection *dets = get_network_boxes(&net, im.w, im.h, thresh, hier_thresh, 0, 1, &nboxes, letterbox);
         if (nms) do_nms_sort(dets, nboxes, l.classes, nms);
         draw_detections_v3(im, dets, nboxes, thresh, names, alphabet, l.classes, ext_output);
-        save_image(im, "predictions");
+        
+        printf("    ]\n");
+        
+        int r = rand() % 999999999;
+        char buf[256];
+        
+        char* fn = basename(input);
+        
+//        snprintf(buf, sizeof buf, "%s_%d", "output/predictions", r);
+        
+        if (nboxes == 0)
+        {
+            // detection false
+            snprintf(buf, sizeof buf, "%s%s", "output/no/", fn);
+        }else{
+            // detection true
+            snprintf(buf, sizeof buf, "%s%s", "output/yes/", fn);
+        }
+        
+        printf("},\n");
+        
+        save_image(im, buf);
         if (!dont_show) {
             show_image(im, "predictions");
         }
