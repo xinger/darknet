@@ -61,18 +61,17 @@ void binarize_input_gpu(float *input, int n, int size, float *binary)
     check_error(cudaPeekAtLastError());
 }
 
-
 __global__ void binarize_weights_kernel(float *weights, int n, int size, float *binary)
 {
     int f = (blockIdx.x + blockIdx.y*gridDim.x) * blockDim.x + threadIdx.x;
     if (f >= n) return;
     int i = 0;
     float mean = 0;
-    for(i = 0; i < size; ++i){
+    for (i = 0; i < size; ++i) {
         mean += fabs(weights[f*size + i]);
     }
     mean = mean / size;
-    for(i = 0; i < size; ++i){
+    for (i = 0; i < size; ++i) {
         binary[f*size + i] = (weights[f*size + i] > 0) ? mean : -mean;
         //binary[f*size + i] = weights[f*size + i];
     }
@@ -80,9 +79,61 @@ __global__ void binarize_weights_kernel(float *weights, int n, int size, float *
 
 void binarize_weights_gpu(float *weights, int n, int size, float *binary)
 {
-    binarize_weights_kernel<<<cuda_gridsize(n), BLOCK>>>(weights, n, size, binary);
+    binarize_weights_kernel << <cuda_gridsize(n), BLOCK >> >(weights, n, size, binary);
     check_error(cudaPeekAtLastError());
 }
+
+#define WARP_SIZE 32
+
+__global__ void set_zero_kernel(float *src, int size)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < size) src[i] = 0;
+}
+
+__inline__ __device__
+float warpAllReduceSum(float val) {
+    for (int mask = WARP_SIZE / 2; mask > 0; mask /= 2)
+        val += __shfl_xor(val, mask);
+    return val;
+}
+
+// only if (size % 32 == 0)
+__global__ void reduce_kernel(float *weights, int n, int size, float *mean_arr_gpu)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int f = i / size;
+    if (f >= n) return;
+    float warp_mean = warpAllReduceSum(fabs(weights[i]));
+    if(i % 32 == 0)
+        atomicAdd(&mean_arr_gpu[f], warp_mean / size);
+}
+
+__global__ void binarize_weights_mean_kernel(float *weights, int n, int size, float *binary, float *mean_arr_gpu)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int f = i / size;
+    if (f >= n) return;
+    float mean = mean_arr_gpu[f];
+    binary[i] = (weights[i] > 0) ? mean : -mean;
+}
+
+void fast_binarize_weights_gpu(float *weights, int n, int size, float *binary, float *mean_arr_gpu)
+{
+    if (size % 32 == 0) {
+        size_t gridsize = n * size;
+        const int num_blocks = gridsize / BLOCK + 1;
+
+        set_zero_kernel << <(n/BLOCK + 1), BLOCK >> > (mean_arr_gpu, n);
+        reduce_kernel << <num_blocks, BLOCK >> > (weights, n, size, mean_arr_gpu);
+        binarize_weights_mean_kernel << <num_blocks, BLOCK >> > (weights, n, size, binary, mean_arr_gpu);
+        check_error(cudaPeekAtLastError());
+    }
+    else {
+        binarize_weights_gpu(weights, n, size, binary);
+    }
+}
+
 
 __global__ void cuda_f32_to_f16(float* input_f32, size_t size, half *output_f16)
 {
@@ -128,7 +179,9 @@ void forward_convolutional_layer_gpu(convolutional_layer l, network_state state)
 
     if(l.xnor){
         if (!l.align_bit_weights_gpu || state.train) {
-            binarize_weights_gpu(l.weights_gpu, l.n, l.c*l.size*l.size, l.binary_weights_gpu);
+            //binarize_weights_gpu(l.weights_gpu, l.n, l.c*l.size*l.size, l.binary_weights_gpu);
+
+            fast_binarize_weights_gpu(l.weights_gpu, l.n, l.c*l.size*l.size, l.binary_weights_gpu, l.mean_arr_gpu);
         }
         //swap_binary(&l);
         //binarize_gpu(state.input, l.c*l.h*l.w*l.batch, l.binary_input_gpu);
@@ -642,17 +695,29 @@ void update_convolutional_layer_gpu(convolutional_layer layer, int batch, float 
         adam_gpu(size, layer.weights_gpu, layer.m_gpu, layer.v_gpu, layer.B1, layer.B2, learning_rate/batch, layer.eps, layer.t+1);
         fill_ongpu(size, 0, layer.weight_updates_gpu, 1);
     }else{
-        // update weights:
-        // weights_gpu = weights_gpu*(1 - decay*lr) + weight_updates_gpu*lr / (batch*subdivision) =
-        //  weights_gpu*(1 - 0.0005*0.001) + weight_updates_gpu*0.001/(64*8) =
-        //  weights_gpu * 0.999 999 5 + weight_updates_gpu * 0.000 001 953125
-        //
-        // weight_updates_gpu = (weight_updates_gpu - weights_gpu*decay*batch*subdivision)*momentum =
-        //  (weight_updates_gpu - weights_gpu * 0.0005 * 64 * 8) * 0.9 =
-        //  weight_updates_gpu*0.9 - weights_gpu*0.2304
-        axpy_ongpu(size, -decay*batch, layer.weights_gpu, 1, layer.weight_updates_gpu, 1);
-        axpy_ongpu(size, learning_rate/batch, layer.weight_updates_gpu, 1, layer.weights_gpu, 1);
-        scal_ongpu(size, momentum, layer.weight_updates_gpu, 1);
+        axpy_ongpu(size, -decay*batch, layer.weights_gpu, 1, layer.weight_updates_gpu, 1);  // wu = wu - w*decay*batch
+        axpy_ongpu(size, learning_rate/batch, layer.weight_updates_gpu, 1, layer.weights_gpu, 1); // w = w + wu*lr/batch
+        scal_ongpu(size, momentum, layer.weight_updates_gpu, 1);    // wu = wu*momentum // wu = (wu - w*decay*batch)*momentum
+        // w = w + (wu - w*decay*batch)*lr/batch = w + wu*lr/batch - w*decay*lr = w*(1-decay*lr) + wu*lr/batch
+        //wu_prev = (wu_old - w_old*decay*batch)*momentum
+
+
+        //weights_update = weights_update_new + (weights_update_old - weights_old*decay*batch)*momentum - weights_new*decay*batch =
+        // = weights_update_new + weights_update_old*momentum - weights_old*decay*batch*momentum - weights_new*decay*batch
+        // = weights_update_new + weights_update_old*momentum - (weights_old*momentum + weights_new)*decay*batch
+
+        //------------- RESULT --------------
+        // weights_update = weights_update_new + weights_update_old*momentum - (weights_old*momentum + weights_new)*decay*batch
+        //-----------------------------------
+
+        // weights_newest = weights_new + (weights_update_new + weights_update_old*momentum - (weights_old*momentum + weights_new)*decay*batch)*lr/batch
+        // = weights_new + weights_update_new*lr/batch + weights_update_old*momentum*lr/batch - weights_old*momentum*decay*batch*lr/batch - weights_new*decay*batch*lr/batch
+        // = weights_new + weights_update_new*lr/batch + weights_update_old*momentum*lr/batch - weights_old*momentum*decay*lr - weights_new*decay*lr
+        // = weights_new*(1 - decay*lr) - weights_old*momentum*decay*lr + (weights_update_new + weights_update_old*momentum)*lr/batch
+
+        //------------- RESULT --------------
+        // weights_newest = weights_new*(1 - decay*lr) - weights_old*momentum*(decay*lr) + (weights_update_new + weights_update_old*momentum)*lr/batch
+        //-----------------------------------
     }
 }
 
